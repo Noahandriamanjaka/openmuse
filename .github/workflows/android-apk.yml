@@ -43,6 +43,10 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Le package historique `tools` n'existe plus dans cmdline-tools 16+,
+          # sdkmanager échoue sinon avec "Failed to find package 'tools'".
+          packages: platform-tools
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
