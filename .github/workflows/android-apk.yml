@@ -1,0 +1,180 @@
+name: Android APK
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      EXPO_PUBLIC_API_URL: ${{ vars.OPENMUSE_API_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate native Android project
+        run: |
+          pnpm --dir apps/mobile exec expo prebuild \
+            --platform android \
+            --clean
+
+      # ------------------------------------------------
+      # PULL REQUEST
+      # Build an installable DEBUG APK.
+      # No personal signing key is ever used on PRs.
+      # ------------------------------------------------
+
+      - name: Build PR debug APK
+        if: github.event_name == 'pull_request'
+        working-directory: apps/mobile/android
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Collect PR APK
+        if: github.event_name == 'pull_request'
+        run: |
+          mkdir -p artifacts
+          cp \
+            apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk \
+            artifacts/OpenMuse-PR-debug.apk
+          ls -lh artifacts/OpenMuse-PR-debug.apk
+
+      - name: Upload PR APK
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenMuse-PR-${{ github.event.pull_request.number }}
+          path: artifacts/OpenMuse-PR-debug.apk
+          retention-days: 14
+
+      # ------------------------------------------------
+      # MAIN / MANUAL
+      # Build the real APK signed with the personal key.
+      # ------------------------------------------------
+
+      - name: Restore personal signing key
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_B64: ${{ secrets.OPENMUSE_KEYSTORE_B64 }}
+        run: |
+          printf '%s' "$KEYSTORE_B64" | base64 --decode \
+            > apps/mobile/android/app/openmuse-upload.jks
+
+          chmod 600 apps/mobile/android/app/openmuse-upload.jks
+
+      - name: Configure release signing
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.OPENMUSE_KEYSTORE_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("apps/mobile/android/app/build.gradle")
+          text = path.read_text()
+
+          signing_marker = "signingConfigs {"
+
+          if signing_marker not in text:
+              raise SystemExit("Could not find signingConfigs block")
+
+          release_config = r'''
+              release {
+                  storeFile file("openmuse-upload.jks")
+                  storePassword System.getenv("OPENMUSE_KEYSTORE_PASSWORD")
+                  keyAlias "openmuse"
+                  keyPassword System.getenv("OPENMUSE_KEYSTORE_PASSWORD")
+              }
+          '''
+
+          text = text.replace(
+              signing_marker,
+              signing_marker + release_config,
+              1,
+          )
+
+          match = re.search(
+              r'(release\s*\{.*?signingConfig\s+)signingConfigs\.debug',
+              text,
+              flags=re.S,
+          )
+
+          if not match:
+              raise SystemExit(
+                  "Could not locate release signingConfig in generated build.gradle"
+              )
+
+          text = (
+              text[:match.start()]
+              + match.group(1)
+              + "signingConfigs.release"
+              + text[match.end():]
+          )
+
+          path.write_text(text)
+
+          print("✅ Personal release signing configured")
+          PY
+
+      - name: Build signed release APK
+        if: github.event_name != 'pull_request'
+        env:
+          OPENMUSE_KEYSTORE_PASSWORD: ${{ secrets.OPENMUSE_KEYSTORE_PASSWORD }}
+        working-directory: apps/mobile/android
+        run: ./gradlew :app:assembleRelease --no-daemon
+
+      - name: Collect release APK
+        if: github.event_name != 'pull_request'
+        run: |
+          APK="apps/mobile/android/app/build/outputs/apk/release/app-release.apk"
+
+          test -f "$APK"
+
+          mkdir -p artifacts
+          cp "$APK" artifacts/OpenMuse-personal.apk
+
+          ls -lh artifacts/OpenMuse-personal.apk
+
+      - name: Upload signed release APK
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenMuse-Android
+          path: artifacts/OpenMuse-personal.apk
+          retention-days: 30
